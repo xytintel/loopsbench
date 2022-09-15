@@ -45,6 +45,26 @@ void eu_copy(queue_t &q, const T *in0, T *out, size_t N, bool verbose = true) {
     print_info(verbose, N, 2*N*sizeof(T), timeit(event));    
 }
 
+template<typename T, typename queue_t>
+void eu_memset(queue_t &q, T *out, size_t N) {
+    int group_size = 256;
+    auto num_groups = (N + group_size - 1) / group_size;
+    auto event = q.submit([&](sycl::handler& h){
+        h.parallel_for(
+            sycl::nd_range<1>(sycl::range<1>(num_groups * group_size), sycl::range<1>(group_size)),
+            [=](sycl::nd_item<1> item) {
+            auto idx = item.get_local_id(0) + item.get_group(0) * item.get_local_range(0);
+            if(idx < N) {
+                floatn temp;
+#pragma unroll
+                for(int i=0; i<FLOAT_N; i++)
+                    temp[i] = 1;
+                out[idx] = temp;
+            }
+        });
+    });
+}
+
 int main() {
     sycl::queue q(sycl::gpu_selector{}, cl::sycl::property_list {cl::sycl::property::queue::enable_profiling()});
     auto d = sizeof(floatn);
@@ -54,7 +74,10 @@ int main() {
     q.fill<float>(in0, 1.0, numel * FLOAT_N);
     
     for(int numel = 1*1024*1024/d; numel < 256*1024*1024/d; numel += 1*1024*1024/d) {
+        // eu_memset(q, in0, numel);
         // q.fill<float>(in0, 1.0, numel * FLOAT_N);
+        q.fill<char>((char*)in0, 1.0, numel * d);
+        q.wait();
         eu_copy(q, in0, out, numel);
     }
 
