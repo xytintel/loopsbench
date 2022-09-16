@@ -54,7 +54,8 @@ void eu_copy(queue_t &q, const T *in0, T *out, size_t N, bool verbose = true) {
 
 int main() {
     sycl::queue q(sycl::gpu_selector{}, cl::sycl::property_list {cl::sycl::property::queue::enable_profiling()});
-    typedef floatn scalar_t;
+    std::cout << "-------------------- output --------------------\n";
+    typedef short scalar_t;
     // typedef sycl::half scalar_t;
     auto d = sizeof(scalar_t);
     int numel = 256*1024*1024/d;
