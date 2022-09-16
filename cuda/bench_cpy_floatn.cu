@@ -34,7 +34,7 @@ void eu_copy(const T *in0, T *out, size_t N, bool verbose = true) {
     l->stream_begin();
     cudaEventRecord(start);
     l->submit(
-        0, {((int)N + group_size - 1) / group_size}, {group_size},
+        0, {(int)((N + group_size - 1) / group_size)}, {group_size},
         [=] DEVICE(KernelInfo &info) {
             auto idx = info.thread_idx(0) + info.thread_range(0) * info.block_idx(0);
             if(idx < N) out[idx] = in0[idx];
@@ -49,6 +49,7 @@ void eu_copy(const T *in0, T *out, size_t N, bool verbose = true) {
 }
 
 int main() {
+    std::cout << "-------------------- output --------------------\n";
     auto l = GpuLauncher::GetInstance();
     auto d = sizeof(floatn);
     int numel = 256*1024*1024/d;
