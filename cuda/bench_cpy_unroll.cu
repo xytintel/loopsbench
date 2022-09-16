@@ -57,6 +57,7 @@ void eu_copy(const T *in0, T *out, size_t N, bool verbose = true) {
 }
 
 int main() {
+    std::cout << "-------------------- output --------------------\n";
     auto l = GpuLauncher::GetInstance();
     typedef short scalar_t;
 
