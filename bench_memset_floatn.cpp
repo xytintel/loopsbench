@@ -24,6 +24,8 @@ struct alignas(sizeof(T) * vec_size) aligned_array {
     }
 };
 typedef aligned_array<float, FLOAT_N> floatn;
+// typedef sycl::half floatn;
+// typedef sycl::ext::oneapi::experimental::bfloat16 floatn;
 
 void print_info(bool enable, size_t N, uint64_t total_bytes, double timems) {
     if (enable)
@@ -45,7 +47,6 @@ void eu_memset(queue_t &q, T *out, size_t N, bool verbose = true) {
                 for(int i=0; i<FLOAT_N; i++)
                     temp[i] = 1;
                 out[idx] = temp;
-
             }
         });
     });
@@ -54,6 +55,7 @@ void eu_memset(queue_t &q, T *out, size_t N, bool verbose = true) {
 
 int main() {
     sycl::queue q(sycl::gpu_selector{}, cl::sycl::property_list {cl::sycl::property::queue::enable_profiling()});
+    std::cout << "-------------------- output --------------------\n";
     auto d = sizeof(floatn);
     int numel = 256*1024*1024/d;
     auto out = sycl::aligned_alloc_device<floatn>(4096, numel, q);
