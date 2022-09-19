@@ -24,6 +24,8 @@ struct alignas(sizeof(T) * vec_size) aligned_array {
     }
 };
 typedef aligned_array<float, FLOAT_N> floatn;
+// typedef sycl::half floatn;
+// typedef sycl::ext::oneapi::experimental::bfloat16 floatn;
 
 void print_info(bool enable, size_t N, uint64_t total_bytes, double timems) {
     if (enable)
@@ -55,8 +57,8 @@ void eu_copy(queue_t &q, const T *in0, T *out, size_t N, bool verbose = true) {
 int main() {
     sycl::queue q(sycl::gpu_selector{}, cl::sycl::property_list {cl::sycl::property::queue::enable_profiling()});
     std::cout << "-------------------- output --------------------\n";
-    typedef short scalar_t;
-    // typedef sycl::half scalar_t;
+    typedef floatn scalar_t;
+
     auto d = sizeof(scalar_t);
     int numel = 256*1024*1024/d;
     auto in0 = sycl::aligned_alloc_device<scalar_t>(4096, numel, q);
