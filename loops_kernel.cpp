@@ -63,6 +63,19 @@ struct StoreWithoutCast {
 
 namespace function {
 
+template <template <int i> typename func, int end, int current = 0>
+struct static_unroll {
+  template <typename... Args> static inline void with_args(Args &&... args) {
+    func<current>::apply(std::forward<Args>(args)...);
+    static_unroll<func, end, current + 1>::with_args(args...);
+  }
+};
+
+template <template <int i> typename func, int end>
+struct static_unroll<func, end, end> {
+  template <typename... Args> static inline void with_args(Args... args) {}
+};
+
 template <class F, class Tuple>
 inline constexpr decltype(auto) apply(F &&f, Tuple &&t) {
   return std::apply(std::forward<F>(f), std::forward<Tuple>(t));
@@ -254,19 +267,6 @@ struct TrivialOffsetCalculator {
 
 namespace policy {
 
-template <template <int i> typename func, int end, int current = 0>
-struct static_unroll {
-  template <typename... Args> static inline void with_args(Args &&... args) {
-    func<current>::apply(std::forward<Args>(args)...);
-    static_unroll<func, end, current + 1>::with_args(args...);
-  }
-};
-
-template <template <int i> typename func, int end>
-struct static_unroll<func, end, end> {
-  template <typename... Args> static inline void with_args(Args... args) {}
-};
-
 template <int arg_index> struct vectorized_load_helper {
   template <typename args_t, typename policy_t, typename offset_t>
   static void apply(policy_t &self, args_t *args, offset_t offset,
@@ -323,7 +323,7 @@ struct vectorized {
       auto linear_idx =
           group_offset + (thread_idx + i * group_items) * vec_size;
       auto offset = input_offset_calculator.get(linear_idx);
-      static_unroll<vectorized_load_helper, arity>::with_args(
+      function::static_unroll<vectorized_load_helper, arity>::with_args(
           *this, args, offset, vec_size * i);
     }
   }
@@ -342,6 +342,104 @@ struct vectorized {
         v.val[j] = from[vec_size * i + j];
       }
       to_[index] = v;
+    }
+  }
+};
+
+template <int arg_index>
+struct unroll_load_helper {
+  template <
+      typename args_t,
+      typename policy_t,
+      typename offset_t,
+      typename loader_t>
+  static void apply(
+      policy_t& self,
+      args_t* args,
+      offset_t offset,
+      loader_t loader,
+      int j,
+      int num_outputs) {
+    using arg_t = std::tuple_element_t<arg_index, args_t>;
+    std::get<arg_index>(args[j]) = loader.template load<arg_t>(
+        self.data[arg_index + num_outputs], offset[arg_index], arg_index);
+  }
+};
+
+template <
+    int ITEM_WORK_SIZE,
+    typename data_t,
+    typename inp_calc_t,
+    typename out_calc_t,
+    typename loader_t,
+    typename storer_t,
+    int num_outputs = 1>
+struct unroll {
+  data_t data;
+  int remaining;
+  inp_calc_t input_offset_calculator;
+  out_calc_t output_offset_calculator;
+  loader_t loader;
+  storer_t storer;
+  int thread_idx;
+  int group_idx;
+  int group_items;
+  int group_work_size;
+
+  unroll(
+      data_t data,
+      int remaining,
+      inp_calc_t ic,
+      out_calc_t oc,
+      loader_t l,
+      storer_t s,
+      int thread_idx,
+      int group_idx,
+      int group_items)
+      : data(data),
+        remaining(remaining),
+        input_offset_calculator(ic),
+        output_offset_calculator(oc),
+        loader(l),
+        storer(s),
+        thread_idx(thread_idx),
+        group_idx(group_idx),
+        group_items(group_items),
+        group_work_size(ITEM_WORK_SIZE * group_items) {}
+
+  inline bool check_inbounds(int thread_work_elem) const {
+    return (thread_idx + thread_work_elem * group_items < remaining);
+  }
+
+  template <typename args_t>
+  inline void load(args_t* args) {
+    constexpr int arity = std::tuple_size<args_t>::value;
+    int thread_idx_ = thread_idx;
+#pragma unroll
+    for (int i = 0; i < ITEM_WORK_SIZE; i++) {
+      if (thread_idx_ >= remaining) {
+        return;
+      }
+      int linear_idx = thread_idx_ + group_work_size * group_idx;
+      auto offset = input_offset_calculator.get(linear_idx);
+      function::static_unroll<unroll_load_helper, arity>::with_args(
+          *this, args, offset, loader, i, num_outputs);
+      thread_idx_ += group_items;
+    }
+  }
+
+  template <typename scalar_t>
+  inline void store(scalar_t* from) {
+    int thread_idx_ = thread_idx;
+#pragma unroll
+    for (int i = 0; i < ITEM_WORK_SIZE; i++) {
+      if (thread_idx_ >= remaining) {
+        return;
+      }
+      int linear_idx = thread_idx_ + group_work_size * group_idx;
+      int offset = output_offset_calculator.get(linear_idx)[0];
+      storer.store(from[i], data[0], offset);
+      thread_idx_ += group_items;
     }
   }
 };
@@ -466,6 +564,120 @@ launch_vectorized_kernel(queue_t &q, int64_t N, const func_t &fn, array_t data,
 
 } // namespace impl
 
+template <typename func_t, bool signed_strides = false, bool fast_mode = false>
+void loops_kernel(TensorIteratorBase& iter, const func_t f) {
+  using traits = function::function_traits<func_t>;
+  using arg0_t = typename traits::result_type;
+  constexpr int ntensors = traits::arity + 1;
+
+  static_assert(iter.can_use_32bit_indexing());
+  static_assert(iter.ninputs() >= traits::arity);
+  static_assert(iter.noutputs() == 1);
+
+  memory::Array<char*, ntensors> data;
+  for (int i = 0; i < ntensors; i++) {
+    data[i] = (char*)iter.data_ptr(i);
+  }
+
+  int64_t numel = iter.numel();
+
+  bool contiguous = iter.is_contiguous();
+  bool dynamic_casting = false;
+  auto item_of_tile = dpcppMaxWorkItemsPerTile();
+  bool latency_case =
+      numel <= item_of_tile * 4; /* on tuning for different data types */
+
+  if (!dynamic_casting) {
+    if (contiguous) {
+      int vec_size = at::native::Memory::can_vectorize_up_to_loop<func_t>(
+          getDeviceIdOfCurrentQueue(), data);
+      auto input_offset_calculator = TrivialOffsetCalculator<traits::arity>();
+      launch_vectorized_kernel(
+          numel, f, data, input_offset_calculator, vec_size);
+    } else {
+      if constexpr (fast_mode) {
+        int vec_size;
+        if (!latency_case &&
+            can_use_broadcast_vectorize<func_t>(iter, data, vec_size) &&
+            !signed_strides) {
+          auto input_offset_calculator =
+              make_input_offset_calculator<traits::arity, signed_strides>(iter);
+          launch_vectorized_kernel(
+              numel, f, data, input_offset_calculator, vec_size);
+          return;
+        }
+      }
+      auto offset_calc =
+          make_offset_calculator<traits::arity + 1, signed_strides>(iter);
+      launch_legacy_kernel(numel, [=](int idx) {
+        auto offsets = offset_calc.get(idx);
+        arg0_t* out = (arg0_t*)(data[0] + offsets[0]);
+        *out = invoke(f, &data.data[1], &offsets.data[1], 1);
+      });
+    }
+  } else {
+    xpu::dpcpp::Array<ScalarType, traits::arity> dtypes;
+    for (int i = 0; i < traits::arity; i++) {
+      dtypes[i] = iter.tensor(i + 1).scalar_type();
+    }
+
+#define HANDLE_DYNAMIC_CAST(REMOVE_DOUBLE)                                     \
+  {                                                                            \
+    if (contiguous) {                                                          \
+      auto loader =                                                            \
+          at::native::Memory::LoadWithCast<traits::arity, REMOVE_DOUBLE>(      \
+              dtypes);                                                         \
+      auto storer = at::native::Memory::StoreWithCast<REMOVE_DOUBLE>(          \
+          iter.tensor(0).scalar_type());                                       \
+      auto input_offset_calculator = TrivialOffsetCalculator<traits::arity>(); \
+      auto output_offset_calculator = TrivialOffsetCalculator<1>();            \
+      launch_unrolled_kernel<UNROLLED_ELEM_PER_WORK_ITEM>(                     \
+          numel,                                                               \
+          f,                                                                   \
+          data,                                                                \
+          input_offset_calculator,                                             \
+          output_offset_calculator,                                            \
+          loader,                                                              \
+          storer);                                                             \
+    } else {                                                                   \
+      at::detail::Array<ScalarType, ntensors> dtypes;                          \
+      for (int i = 0; i < ntensors; i++) {                                     \
+        dtypes[i] = iter.dtype(i);                                             \
+      }                                                                        \
+      auto offset_calc =                                                       \
+          make_offset_calculator<traits::arity + 1, signed_strides>(iter);     \
+      launch_legacy_kernel<UNROLLED_ELEM_PER_WORK_ITEM>(numel, [=](int idx) {  \
+        auto offsets = offset_calc.get(idx);                                   \
+        void* out = data[0] + offsets[0];                                      \
+        arg0_t result = invoke_with_cast<REMOVE_DOUBLE>(                       \
+            f, &data.data[1], &offsets.data[1], &dtypes.data[1], 1);           \
+        if constexpr (REMOVE_DOUBLE)                                           \
+          at::native::Memory::no_double_cast_and_store<arg0_t>(                \
+              dtypes[0], out, result);                                         \
+        else                                                                   \
+          c10::cast_and_store<arg0_t>(dtypes[0], out, result);                 \
+      });                                                                      \
+    }                                                                          \
+  }
+
+#ifndef USE_SPLIT_FP64_LOOPS
+    if constexpr (fast_mode)
+#endif
+    {
+      if (!has_double_arg<func_t>(iter)) {
+        HANDLE_DYNAMIC_CAST(true)
+        return;
+      }
+    }
+
+    HANDLE_DYNAMIC_CAST(false)
+
+#undef HANDLE_DYNAMIC_CAST
+  }
+}
+
 } // namespace loops
 
-int main() {}
+int main() {
+
+}
