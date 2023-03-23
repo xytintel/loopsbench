@@ -26,7 +26,7 @@ constexpr sycl::queue& dpcppGetCurrentQueue() { return q; }
 #define DPCPP_Q_CGF(H) [&](sycl::handler& H)
 #define DPCPP_Q_SUBMIT(Q, X) { \
     auto e = Q.submit(X);      \
-    e.wait(); print_info(true, 0, 0, timeit(e));       \
+    e.wait(); auto tt = timeit(e); print_info(true, 0, 0, tt);  return tt;     \
 }
 template <typename ScalarType, int Dims = 1>
 using dpcpp_local_acc_t = sycl::local_accessor<ScalarType, Dims>;
@@ -53,7 +53,7 @@ inline int DivUp(int a, int b) {
   return (a + b - 1) / b;
 }
 
-void interaction_kernel(
+double interaction_kernel(
     half* __restrict__ input_mlp,
     half* __restrict__ input,
     half* __restrict__ output,
@@ -214,11 +214,19 @@ void interaction_kernel(
 } // impl
 
 int main() {
+    // dpcpp -fsycl -Xs '-options " -cl-poison-unsupported-fp64-kernels -cl-intel-enable-auto-large-GRF-mode"' interact.cpp ; ./a.out
     auto& q = dpcppGetCurrentQueue();
+    double tt = 0;
+    double count = 0;
     for (int i=0; i<5; i++) {
         auto in0 = sycl::aligned_alloc_device<half>(4096, 1*32768*128, q);
         auto in1 = sycl::aligned_alloc_device<half>(4096, 26*32768*128, q);
         auto out = sycl::aligned_alloc_device<half>(4096, 32768*479, q);
-        impl::interaction_kernel(in0, in1, out, 32768, 27, 128);
+        tt += impl::interaction_kernel(in0, in1, out, 32768, 27, 128);
+        count++;
     }
+    tt /= count;
+    std::cout << tt << std::endl;
+    if (tt>1) return 1;
+    else return 0;
 }
